@@ -2588,36 +2588,51 @@ class TestCodexAdapterReasoningTranslation:
         return adapter, captured_kwargs
 
 
-    def test_recovers_from_sdk_output_none_typeerror(self):
+    def test_ignores_completed_response_with_null_output(self):
         from agent.auxiliary_client import _CodexCompletionsAdapter
 
         message_item = SimpleNamespace(
             type="message",
+            role="assistant",
+            status="completed",
             content=[SimpleNamespace(type="output_text", text="Recovered Title")],
         )
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_text.delta", delta="Recovered "),
+            SimpleNamespace(type="response.output_text.delta", delta="Title"),
+            SimpleNamespace(type="response.output_item.done", item=message_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(
+                    status="completed",
+                    id="resp_null_output",
+                    output=None,
+                    usage=SimpleNamespace(input_tokens=2, output_tokens=2, total_tokens=4),
+                ),
+            ),
+        ]
 
-        class _BrokenStream:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
+        class _CreateStream:
             def __iter__(self):
-                yield SimpleNamespace(type="response.output_text.delta", delta="Recovered ")
-                yield SimpleNamespace(type="response.output_text.delta", delta="Title")
-                yield SimpleNamespace(type="response.output_item.done", item=message_item)
-                raise TypeError("'NoneType' object is not iterable")
+                return iter(events)
 
-            def get_final_response(self):
-                raise AssertionError("final response should not be requested after SDK TypeError")
+            def close(self):
+                pass
+
+        captured_kwargs = {}
+
+        def _create(**kwargs):
+            captured_kwargs.update(kwargs)
+            return _CreateStream()
 
         real_client = MagicMock()
-        real_client.responses.stream.return_value = _BrokenStream()
+        real_client.responses.create = _create
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.4-mini")
 
         response = adapter.create(messages=[{"role": "user", "content": "title this"}])
 
+        assert captured_kwargs["stream"] is True
         assert response.choices[0].message.content == "Recovered Title"
 
     def test_reasoning_effort_medium_translated_to_top_level(self):
