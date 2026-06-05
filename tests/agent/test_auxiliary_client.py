@@ -1823,6 +1823,39 @@ class TestCodexAdapterReasoningTranslation:
         adapter = _CodexCompletionsAdapter(real_client, "gpt-5.3-codex")
         return adapter, captured_kwargs
 
+
+    def test_recovers_from_sdk_output_none_typeerror(self):
+        from agent.auxiliary_client import _CodexCompletionsAdapter
+
+        message_item = SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text="Recovered Title")],
+        )
+
+        class _BrokenStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def __iter__(self):
+                yield SimpleNamespace(type="response.output_text.delta", delta="Recovered ")
+                yield SimpleNamespace(type="response.output_text.delta", delta="Title")
+                yield SimpleNamespace(type="response.output_item.done", item=message_item)
+                raise TypeError("'NoneType' object is not iterable")
+
+            def get_final_response(self):
+                raise AssertionError("final response should not be requested after SDK TypeError")
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = _BrokenStream()
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.4-mini")
+
+        response = adapter.create(messages=[{"role": "user", "content": "title this"}])
+
+        assert response.choices[0].message.content == "Recovered Title"
+
     def test_reasoning_effort_medium_translated_to_top_level(self):
         adapter, captured = self._build_adapter()
         adapter.create(

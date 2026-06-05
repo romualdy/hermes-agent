@@ -764,46 +764,70 @@ class _CodexCompletionsAdapter:
                 timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
-            _check_cancelled()
-            with self._client.responses.stream(**resp_kwargs) as stream:
-                for _event in stream:
-                    _check_cancelled()
-                    _etype = getattr(_event, "type", "")
-                    if _etype == "response.output_item.done":
-                        _done = getattr(_event, "item", None)
-                        if _done is not None:
-                            collected_output_items.append(_done)
-                    elif "output_text.delta" in _etype:
-                        _delta = getattr(_event, "delta", "")
-                        if _delta:
-                            collected_text_deltas.append(_delta)
-                    elif "function_call" in _etype:
-                        has_function_calls = True
-                _check_cancelled()
-                final = stream.get_final_response()
-
-            # Backfill empty output from collected stream events
-            _output = getattr(final, "output", None)
-            if isinstance(_output, list) and not _output:
+            def _recover_final_from_stream(reason: str):
                 if collected_output_items:
-                    final.output = list(collected_output_items)
                     logger.debug(
-                        "Codex auxiliary: backfilled %d output items from stream events",
-                        len(collected_output_items),
+                        "Codex auxiliary: recovered %d output items after %s",
+                        len(collected_output_items), reason,
                     )
-                elif collected_text_deltas and not has_function_calls:
+                    return SimpleNamespace(output=list(collected_output_items), status="completed", model=model)
+                if collected_text_deltas and not has_function_calls:
                     # Only synthesize text when no tool calls were streamed —
                     # a function_call response with incidental text should not
                     # be collapsed into a plain-text message.
                     assembled = "".join(collected_text_deltas)
-                    final.output = [SimpleNamespace(
-                        type="message", role="assistant", status="completed",
-                        content=[SimpleNamespace(type="output_text", text=assembled)],
-                    )]
                     logger.debug(
-                        "Codex auxiliary: synthesized from %d deltas (%d chars)",
-                        len(collected_text_deltas), len(assembled),
+                        "Codex auxiliary: recovered %d deltas (%d chars) after %s",
+                        len(collected_text_deltas), len(assembled), reason,
                     )
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message", role="assistant", status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        status="completed",
+                        model=model,
+                    )
+                return None
+
+            _check_cancelled()
+            try:
+                with self._client.responses.stream(**resp_kwargs) as stream:
+                    for _event in stream:
+                        _check_cancelled()
+                        _etype = getattr(_event, "type", "")
+                        if _etype == "response.output_item.done":
+                            _done = getattr(_event, "item", None)
+                            if _done is not None:
+                                collected_output_items.append(_done)
+                        elif "output_text.delta" in _etype:
+                            _delta = getattr(_event, "delta", "")
+                            if _delta:
+                                collected_text_deltas.append(_delta)
+                        elif "function_call" in _etype:
+                            has_function_calls = True
+                    _check_cancelled()
+                    final = stream.get_final_response()
+            except TypeError as exc:
+                # OpenAI SDK 2.24.0 can crash while parsing the final
+                # response.completed event from chatgpt.com/backend-api/codex
+                # when the terminal snapshot contains ``output: null``. The
+                # useful auxiliary output has already arrived as stream events.
+                if "NoneType" in str(exc) and "iterable" in str(exc):
+                    recovered = _recover_final_from_stream("SDK output=None TypeError")
+                    if recovered is not None:
+                        final = recovered
+                    else:
+                        raise
+                else:
+                    raise
+
+            # Backfill empty output from collected stream events
+            _output = getattr(final, "output", None)
+            if isinstance(_output, list) and not _output:
+                recovered = _recover_final_from_stream("empty final output")
+                if recovered is not None:
+                    final = recovered
 
             # Extract text and tool calls from the Responses output.
             # Items may be SDK objects (attrs) or dicts (raw/fallback paths),

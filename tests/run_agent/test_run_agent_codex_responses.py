@@ -422,6 +422,43 @@ def test_run_codex_stream_retries_when_completed_event_missing(monkeypatch):
     assert response.output[0].content[0].text == "stream ok"
 
 
+
+def test_run_codex_stream_recovers_from_sdk_output_none_typeerror(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    message_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="stream recovered")],
+    )
+
+    class _SdkBrokenStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield SimpleNamespace(type="response.created")
+            yield SimpleNamespace(type="response.output_text.delta", delta="stream ")
+            yield SimpleNamespace(type="response.output_text.delta", delta="recovered")
+            yield SimpleNamespace(type="response.output_item.done", item=message_item)
+            raise TypeError("'NoneType' object is not iterable")
+
+        def get_final_response(self):
+            raise AssertionError("SDK TypeError should be recovered before final response lookup")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _SdkBrokenStream(),
+            create=lambda **kwargs: _codex_message_response("fallback should not run"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "stream recovered"
+
 def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0, "create": 0}

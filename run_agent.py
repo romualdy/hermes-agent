@@ -2098,6 +2098,24 @@ class AIAgent:
             _api_retries = 3
         self._api_max_retries = _api_retries
 
+        # API retry backoff tuning.  These values control the wait between
+        # retries for transient provider failures and rate limits.
+        try:
+            _raw_retry_base = _agent_section.get("api_retry_base_delay", 3.0)
+            self._api_retry_base_delay = max(float(_raw_retry_base), 0.0)
+        except (TypeError, ValueError):
+            self._api_retry_base_delay = 3.0
+        try:
+            _raw_retry_multiplier = _agent_section.get("api_retry_multiplier", 1.8)
+            self._api_retry_multiplier = max(float(_raw_retry_multiplier), 1.0)
+        except (TypeError, ValueError):
+            self._api_retry_multiplier = 1.8
+        try:
+            _raw_retry_max_delay = _agent_section.get("api_retry_max_delay", 90.0)
+            self._api_retry_max_delay = max(float(_raw_retry_max_delay), 0.0)
+        except (TypeError, ValueError):
+            self._api_retry_max_delay = 90.0
+
         # Initialize context compressor for automatic context management
         # Compresses conversation when approaching model's context limit
         # Configuration via config.yaml (compression section)
@@ -6947,6 +6965,35 @@ class AIAgent:
         # returns empty output (e.g. chatgpt.com backend-api sends
         # response.incomplete instead of response.completed).
         self._codex_streamed_text_parts: list = []
+        def _response_from_collected_stream_items(reason: str):
+            if collected_output_items:
+                logger.debug(
+                    "Codex stream: recovered %d output items after %s",
+                    len(collected_output_items), reason,
+                )
+                return SimpleNamespace(
+                    output=list(collected_output_items),
+                    status="completed",
+                    model=api_kwargs.get("model"),
+                )
+            if self._codex_streamed_text_parts and not has_tool_calls:
+                assembled = "".join(self._codex_streamed_text_parts)
+                logger.debug(
+                    "Codex stream: recovered %d text deltas (%d chars) after %s",
+                    len(self._codex_streamed_text_parts), len(assembled), reason,
+                )
+                return SimpleNamespace(
+                    output=[SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )],
+                    status="completed",
+                    model=api_kwargs.get("model"),
+                )
+            return None
+
         for attempt in range(max_stream_retries + 1):
             if self._interrupt_requested:
                 raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -7041,6 +7088,19 @@ class AIAgent:
                     exc,
                 )
                 return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            except TypeError as exc:
+                # OpenAI SDK 2.24.0 can crash while parsing the final
+                # response.completed event from chatgpt.com/backend-api/codex
+                # when the terminal snapshot contains ``output: null``. By
+                # then the useful content has already arrived as stream
+                # output_item/text events, so recover from those instead of
+                # treating a successful model turn as a provider failure.
+                err_text = str(exc)
+                if "NoneType" in err_text and "iterable" in err_text:
+                    recovered = _response_from_collected_stream_items("SDK output=None TypeError")
+                    if recovered is not None:
+                        return recovered
+                raise
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -12941,8 +13001,14 @@ class AIAgent:
                                 "failed": True  # Mark as failure for filtering
                             }
                         
-                        # Backoff before retry — jittered exponential: 5s base, 120s cap
-                        wait_time = jittered_backoff(retry_count, base_delay=5.0, max_delay=120.0)
+                        # Backoff before retry — uses the configurable Hermes retry
+                        # schedule (base delay, multiplier, max delay) with jitter.
+                        wait_time = jittered_backoff(
+                            retry_count,
+                            base_delay=self._api_retry_base_delay,
+                            max_delay=self._api_retry_max_delay,
+                            multiplier=self._api_retry_multiplier,
+                        )
                         self._vprint(f"{self.log_prefix}⏳ Retrying in {wait_time:.1f}s ({_failure_hint})...", force=True)
                         logging.warning(f"Invalid API response (retry {retry_count}/{max_retries}): {', '.join(error_details)} | Provider: {provider_name}")
                         
@@ -14462,7 +14528,12 @@ class AIAgent:
                                     _retry_after = min(float(_ra_raw), 120)  # Cap at 2 minutes
                                 except (TypeError, ValueError):
                                     pass
-                    wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+                    wait_time = _retry_after if _retry_after else jittered_backoff(
+                        retry_count,
+                        base_delay=self._api_retry_base_delay,
+                        max_delay=self._api_retry_max_delay,
+                        multiplier=self._api_retry_multiplier,
+                    )
                     if is_rate_limited:
                         self._emit_status(f"⏱️ Rate limited. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries})...")
                     else:

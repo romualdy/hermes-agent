@@ -22,6 +22,7 @@ def jittered_backoff(
     base_delay: float = 5.0,
     max_delay: float = 120.0,
     jitter_ratio: float = 0.5,
+    multiplier: float = 2.0,
 ) -> float:
     """Compute a jittered exponential backoff delay.
 
@@ -31,9 +32,10 @@ def jittered_backoff(
         max_delay: Maximum delay cap in seconds.
         jitter_ratio: Fraction of computed delay to use as random jitter
             range.  0.5 means jitter is uniform in [0, 0.5 * delay].
+        multiplier: Exponential growth factor between attempts.
 
     Returns:
-        Delay in seconds: min(base * 2^(attempt-1), max_delay) + jitter.
+        Delay in seconds: min(base * multiplier^(attempt-1), max_delay) + jitter.
 
     The jitter decorrelates concurrent retries so multiple sessions
     hitting the same provider don't all retry at the same instant.
@@ -47,7 +49,8 @@ def jittered_backoff(
     if exponent >= 63 or base_delay <= 0:
         delay = max_delay
     else:
-        delay = min(base_delay * (2 ** exponent), max_delay)
+        growth = multiplier if multiplier and multiplier > 0 else 2.0
+        delay = min(base_delay * (growth ** exponent), max_delay)
 
     # Seed from time + counter for decorrelation even with coarse clocks.
     seed = (time.time_ns() ^ (tick * 0x9E3779B9)) & 0xFFFFFFFF

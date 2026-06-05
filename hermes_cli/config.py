@@ -466,6 +466,13 @@ DEFAULT_CONFIG = {
         # on flaky primaries; raise it if you prefer to tolerate longer
         # provider hiccups on a single provider.
         "api_max_retries": 3,
+        # Retry backoff tuning for the Hermes-level API loop.
+        # Attempt 1 waits api_retry_base_delay seconds, then grows by
+        # api_retry_multiplier per attempt, with the delay capped by
+        # api_retry_max_delay before jitter is added.
+        "api_retry_base_delay": 3.0,
+        "api_retry_multiplier": 1.8,
+        "api_retry_max_delay": 90.0,
         "service_tier": "",
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.

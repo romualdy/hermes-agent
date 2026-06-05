@@ -380,11 +380,11 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "qwen3.5-plus",
     ],
     "kilocode": [
-        "anthropic/claude-opus-4.6",
-        "anthropic/claude-sonnet-4.6",
-        "openai/gpt-5.4",
-        "google/gemini-3-pro-preview",
-        "google/gemini-3-flash-preview",
+        "kilo-auto/free",
+        "nvidia/nemotron-3-super-120b-a12b",
+        "poolside/laguna-m.1:free",
+        "openrouter/free",
+        "openrouter/owl-alpha",
     ],
     # Alibaba DashScope Coding platform (coding-intl) — default endpoint.
     # Supports Qwen models + third-party providers (GLM, Kimi, MiniMax).
@@ -2086,7 +2086,6 @@ _MODELS_DEV_PREFERRED: frozenset[str] = frozenset({
     "opencode-go",
     "opencode-zen",
     "deepseek",
-    "kilocode",
     "fireworks",
     "mistral",
     "togetherai",
