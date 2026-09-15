@@ -36,6 +36,9 @@ outputs:
   token:
     description: A GitHub App installation access token (1-hour TTL), or GITHUB_TOKEN on forks.
     value: ${{ steps.app-token.outputs.token || steps.fallback.outputs.token }}
+  is-app-token:
+    description: Whether the returned token came from the configured GitHub App.
+    value: ${{ steps.check.outputs.has_app }}
 
 runs:
   using: composite

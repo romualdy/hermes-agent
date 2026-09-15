@@ -14,6 +14,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -96,7 +97,7 @@ jobs:
           # 10 GB quota of the repository and helps no later run. A PR still
           # restores: it reads the cache that the merge to main wrote. This is
           # the same rule that docker.yml applies to `cache-to`.
-          save: ${{ github.event_name != 'pull_request' }}
+          save: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') }}
 
           # Collect garbage before the save, so the store stays inside the
           # 10 GB quota of the repository. Without a limit the store grows at
