@@ -1,0 +1,47 @@
+name: Finalize JS autofix fallback
+
+# A PR created with GITHUB_TOKEN does not trigger pull_request workflows. The
+# producer dispatches CI explicitly on bot/js-autofix; this trusted workflow
+# receives the immutable completed run and closes or promotes that exact SHA.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: js-autofix-finalize-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  finalize:
+    if: >-
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      github.event.workflow_run.head_branch == 'bot/js-autofix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: trusted-automation
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Finalize fallback PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          CI_RUN_ID: ${{ github.event.workflow_run.id }}
+          CI_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          git fetch origin "$HEAD_SHA"
+          python scripts/ci/finalize_js_autofix.py \
+            --repo "${{ github.repository }}" \
+            --head-sha "$HEAD_SHA" \
+            --ci-run-id "$CI_RUN_ID" \
+            --ci-attempt "$CI_ATTEMPT"

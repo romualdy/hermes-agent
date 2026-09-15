@@ -12,6 +12,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
   release:
     types: [published]
 
@@ -125,7 +126,7 @@ jobs:
           build-args: |
             HERMES_GIT_SHA=${{ github.sha }}
           cache-from: ${{ matrix.cache-from }}
-          cache-to: ${{ (github.event_name != 'pull_request') && matrix.cache-to || '' }}
+          cache-to: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && matrix.cache-to || '' }}
 
 
       # Run the docker-integration test suite against the freshly-built
