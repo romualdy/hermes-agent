@@ -136,13 +136,16 @@ jobs:
     needs: generate-patch
     # Skip entirely when generate-patch found no fixes — saves a runner,
     # avoids a redundant checkout/download, and keeps the job graph honest.
-    if: needs.generate-patch.outputs.has-fixes == 'true'
+    if: >-
+      needs.generate-patch.outputs.has-fixes == 'true' &&
+      github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: trusted-automation
     permissions:
       contents: write # needed to push to bot/js-autofix
       pull-requests: write # needed for PR creation + auto-merge
+      actions: write # fallback token dispatches CI for the bot branch and merged main
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -164,6 +167,7 @@ jobs:
           path: ${{ runner.temp }}
 
       - name: Apply patch and push to bot branch
+        id: push-bot
         env:
           BOT_BRANCH: bot/js-autofix
         run: |
@@ -185,15 +189,127 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "fmt(js): \`npm run fix\` on merge"
+          git commit \
+            -m "fmt(js): \`npm run fix\` on merge" \
+            -m "Autofix-Producer-Run: $GITHUB_RUN_ID" \
+            -m "Autofix-Producer-Attempt: $GITHUB_RUN_ATTEMPT"
 
           # Push to the dedicated bot branch. Force-push is safe here:
           # bot/js-autofix is a bot-only branch that gets rewritten each run.
           # If the branch was deleted after a previous PR merge, this
           # recreates it.
-          git push --force origin HEAD:"$BOT_BRANCH"
+          BOT_SHA=$(git rev-parse HEAD)
+          echo "head-sha=$BOT_SHA" >> "$GITHUB_OUTPUT"
+          PUSHED=false
+          for i in $(seq 1 5); do
+            if git push --force origin HEAD:"$BOT_BRANCH"; then
+              PUSHED=true
+              break
+            fi
+            REMOTE=$(git ls-remote --heads origin "refs/heads/$BOT_BRANCH" 2>/dev/null) || true
+            if [ -n "$REMOTE" ]; then
+              REMOTE_SHA=${REMOTE%%[[:space:]]*}
+              if [ "$REMOTE_SHA" = "$BOT_SHA" ]; then
+                PUSHED=true
+                break
+              fi
+              echo "::error::Bot branch moved to a different head; refusing to overwrite it"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::Could not push or verify exact bot branch after 5 attempts"
+            exit 1
+          fi
 
-      - name: Create/update PR and enable auto-merge
+      - name: Write fallback provenance
+        id: provenance-write
+        if: steps.app-token.outputs.is-app-token != 'true'
+        env:
+          HEAD_SHA: ${{ steps.push-bot.outputs.head-sha }}
+          BASE_SHA: ${{ github.sha }}
+          PRODUCER_RUN_ID: ${{ github.run_id }}
+          PRODUCER_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          jq -n \
+            --argjson run_id "$PRODUCER_RUN_ID" \
+            --argjson run_attempt "$PRODUCER_RUN_ATTEMPT" \
+            --arg head_sha "$HEAD_SHA" \
+            --arg base_sha "$BASE_SHA" \
+            '{run_id: $run_id, run_attempt: $run_attempt, head_sha: $head_sha, base_sha: $base_sha}' \
+            > "$RUNNER_TEMP/js-autofix-provenance.json"
+
+      - name: Upload fallback provenance
+        id: provenance-upload
+        if: steps.app-token.outputs.is-app-token != 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: js-autofix-provenance-${{ github.run_id }}-${{ github.run_attempt }}-1
+          path: ${{ runner.temp }}/js-autofix-provenance.json
+          retention-days: 7
+
+      - name: Retry fallback provenance upload
+        id: provenance-upload-retry
+        if: >-
+          steps.app-token.outputs.is-app-token != 'true' &&
+          steps.provenance-upload.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: js-autofix-provenance-${{ github.run_id }}-${{ github.run_attempt }}-2
+          path: ${{ runner.temp }}/js-autofix-provenance.json
+          retention-days: 7
+
+      - name: Clean up failed provenance handoff
+        if: >-
+          always() &&
+          steps.app-token.outputs.is-app-token != 'true' &&
+          steps.provenance-upload.outcome == 'failure' &&
+          steps.provenance-upload-retry.outcome == 'failure'
+        env:
+          BOT_BRANCH: bot/js-autofix
+          BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
+        run: |
+          set -u
+          CLEANED=false
+          for i in $(seq 1 5); do
+            if git push \
+              --force-with-lease="refs/heads/$BOT_BRANCH:$BOT_SHA" \
+              origin --delete "$BOT_BRANCH"; then
+              CLEANED=true
+              break
+            fi
+            REMOTE=$(git ls-remote --heads origin "refs/heads/$BOT_BRANCH" 2>/dev/null) || {
+              sleep $((i * 5))
+              continue
+            }
+            if [ -z "$REMOTE" ]; then
+              CLEANED=true
+              break
+            fi
+            REMOTE_SHA=${REMOTE%%[[:space:]]*}
+            if [ "$REMOTE_SHA" != "$BOT_SHA" ]; then
+              echo "::error::Bot branch moved; refusing to delete a newer head"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$CLEANED" != "true" ]; then
+            echo "::error::Could not verify or delete exact bot branch after 5 attempts"
+            exit 1
+          fi
+          echo "::error::Fallback provenance upload failed twice; exact bot branch removed"
+          exit 1
+
+      - name: Create/update PR
+        id: manage-pr
+        if: >-
+          steps.app-token.outputs.is-app-token == 'true' ||
+          steps.provenance-upload.outcome == 'success' ||
+          steps.provenance-upload-retry.outcome == 'success'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           BOT_BRANCH: bot/js-autofix
@@ -213,20 +329,151 @@ jobs:
             PR_NUM=$(echo "$PR_URL" | grep -oE '[0-9]+$')
           fi
 
-          # Enable auto-merge (squash). If already enabled, this is a no-op.
-          gh pr merge "$PR_NUM" --auto --squash || true
+          echo "pr-number=$PR_NUM" >> "$GITHUB_OUTPUT"
 
-      - name: Wait for merge, auto-close on failure or stale
+      - name: Dispatch fallback CI
+        id: dispatch-fallback
+        if: >-
+          steps.app-token.outputs.is-app-token != 'true' &&
+          steps.manage-pr.outcome == 'success' &&
+          steps.manage-pr.outputs.pr-number != '' &&
+          (steps.provenance-upload.outcome == 'success' ||
+          steps.provenance-upload-retry.outcome == 'success')
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          START_SHA: ${{ github.sha }}
+          BOT_BRANCH: bot/js-autofix
+          BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
+          PR_NUM: ${{ steps.manage-pr.outputs.pr-number }}
         run: |
           set -euo pipefail
 
-          PR_NUM=$(gh pr list --head bot/js-autofix --state open --json number --jq '.[0].number' 2>/dev/null || true)
-          if [ -z "$PR_NUM" ]; then
-            echo "No open PR. Nothing to wait for."
+          # GITHUB_TOKEN-created PRs intentionally do not trigger pull_request
+          # workflows. Dispatch the same CI orchestrator on the bot branch;
+          # js-autofix-finalize.yml receives that exact completed run and owns
+          # validation-to-merge cleanup outside this job's lifetime.
+          for i in $(seq 1 5); do
+            if gh workflow run ci.yaml --ref "$BOT_BRANCH"; then
+              echo "accepted=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep $((i * 5))
+          done
+
+          echo "::error::Could not dispatch fallback CI after 5 attempts"
+          for i in $(seq 1 5); do
+            ACCEPTED=$(gh run list \
+              --workflow ci.yaml \
+              --branch "$BOT_BRANCH" \
+              --event workflow_dispatch \
+              --limit 20 \
+              --json databaseId,headSha \
+              --jq ".[] | select(.headSha == \"$BOT_SHA\") | .databaseId" \
+              | head -n 1) || true
+            if [ -n "$ACCEPTED" ]; then
+              echo "accepted=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep $((i * 5))
+          done
+
+          DELETED=false
+          for i in $(seq 1 5); do
+            if git push \
+              --force-with-lease="refs/heads/$BOT_BRANCH:$BOT_SHA" \
+              origin --delete "$BOT_BRANCH"; then
+              DELETED=true
+              break
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$DELETED" != "true" ]; then
+            echo "::error::Could not verify or delete exact bot branch after 5 attempts"
+            exit 1
+          fi
+
+          [ -n "$PR_NUM" ] || exit 1
+          for i in $(seq 1 5); do
+            PR_JSON=$(gh pr view "$PR_NUM" --json state,headRefOid 2>/dev/null) || {
+              sleep $((i * 5))
+              continue
+            }
+            STATE=$(jq -r '.state' <<<"$PR_JSON")
+            PR_HEAD=$(jq -r '.headRefOid' <<<"$PR_JSON")
+            if [ "$STATE" != "OPEN" ]; then
+              exit 1
+            fi
+            if [ "$PR_HEAD" != "$BOT_SHA" ]; then
+              echo "Newer producer owns PR #$PR_NUM. Leaving it untouched."
+              exit 1
+            fi
+            if gh pr close "$PR_NUM"; then
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          echo "::error::Exact bot branch was removed, but PR state could not be finalized"
+          exit 1
+
+      - name: Wait for merge, auto-close on failure or stale
+        if: always() && steps.app-token.outputs.is-app-token == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          START_SHA: ${{ github.sha }}
+          BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
+          MANAGE_OUTCOME: ${{ steps.manage-pr.outcome }}
+          MANAGED_PR_NUM: ${{ steps.manage-pr.outputs.pr-number }}
+        run: |
+          set -euo pipefail
+
+          PR_NUM="$MANAGED_PR_NUM"
+          if [ -z "$PR_NUM" ] && [ -z "$BOT_SHA" ] && [ "$MANAGE_OUTCOME" != "failure" ]; then
+            echo "No autofix head was produced. Nothing to wait for."
             exit 0
+          fi
+          if [ -z "$PR_NUM" ]; then
+            for i in $(seq 1 5); do
+              if PR_NUM=$(gh pr list --head bot/js-autofix --state open --json number --jq '.[0].number' 2>/dev/null); then
+                [ -n "$PR_NUM" ] && break
+              fi
+              sleep $((i * 5))
+            done
+          fi
+          if [ -z "$PR_NUM" ]; then
+            if [ "$MANAGE_OUTCOME" = "failure" ] && [ -n "$BOT_SHA" ]; then
+              for i in $(seq 1 5); do
+                git push \
+                  --force-with-lease="refs/heads/bot/js-autofix:$BOT_SHA" \
+                  origin --delete bot/js-autofix && exit 1
+                sleep $((i * 5))
+              done
+              echo "::error::PR creation failed and exact App bot branch cleanup could not be verified"
+              exit 1
+            fi
+            echo "::error::Managed PR was not visible after 5 attempts"
+            exit 1
+          fi
+          if [ -z "$BOT_SHA" ]; then
+            echo "::error::This run did not push a bot head; refusing to adopt an older PR"
+            exit 1
+          fi
+          PR_HEAD=$(gh pr view "$PR_NUM" --json headRefOid --jq '.headRefOid')
+          if [ "$PR_HEAD" != "$BOT_SHA" ]; then
+            echo "PR #$PR_NUM belongs to another run. Leaving it untouched."
+            exit 0
+          fi
+
+          AUTO_MERGE=false
+          for i in $(seq 1 5); do
+            if gh pr merge "$PR_NUM" --auto --squash; then
+              AUTO_MERGE=true
+              break
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$AUTO_MERGE" != "true" ]; then
+            echo "::error::Could not enable auto-merge after 5 attempts"
+            gh pr close "$PR_NUM" --delete-branch
+            exit 1
           fi
 
           echo "Waiting for PR #$PR_NUM to merge..."
@@ -274,3 +521,76 @@ jobs:
           done
 
           echo "Timeout reached. Auto-merge will handle PR #$PR_NUM if CI passes."
+
+      - name: Clean up interrupted fallback producer
+        if: >-
+          always() &&
+          steps.app-token.outputs.is-app-token != 'true' &&
+          (cancelled() ||
+          ((steps.push-bot.outcome == 'failure' ||
+          steps.manage-pr.outcome == 'failure' ||
+          steps.provenance-write.outcome == 'failure' ||
+          (steps.provenance-upload.outcome == 'failure' &&
+          steps.provenance-upload-retry.outcome == 'failure')) &&
+          steps.dispatch-fallback.outputs.accepted != 'true'))
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_BRANCH: bot/js-autofix
+          BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
+          PR_NUM: ${{ steps.manage-pr.outputs.pr-number }}
+        run: |
+          set -u
+          [ -n "$BOT_SHA" ] || exit 0
+
+          if [ -z "$PR_NUM" ]; then
+            for i in $(seq 1 5); do
+              PR_NUM=$(gh pr list \
+                --head "$BOT_BRANCH" \
+                --state open \
+                --json number,headRefOid \
+                --jq ".[] | select(.headRefOid == \"$BOT_SHA\") | .number" \
+                | head -n 1) || true
+              [ -n "$PR_NUM" ] && break
+              sleep $((i * 5))
+            done
+          fi
+
+          CLEANED=false
+          for i in $(seq 1 5); do
+            if git push \
+              --force-with-lease="refs/heads/$BOT_BRANCH:$BOT_SHA" \
+              origin --delete "$BOT_BRANCH"; then
+              CLEANED=true
+              break
+            fi
+            REMOTE=$(git ls-remote --heads origin "refs/heads/$BOT_BRANCH" 2>/dev/null) || {
+              sleep $((i * 5))
+              continue
+            }
+            if [ -z "$REMOTE" ]; then
+              CLEANED=true
+              break
+            fi
+            REMOTE_SHA=${REMOTE%%[[:space:]]*}
+            [ "$REMOTE_SHA" != "$BOT_SHA" ] && exit 0
+            sleep $((i * 5))
+          done
+          if [ "$CLEANED" != "true" ]; then
+            echo "::error::Could not verify or delete exact bot branch after 5 attempts"
+            exit 1
+          fi
+
+          [ -n "$PR_NUM" ] || exit 0
+          for i in $(seq 1 5); do
+            PR_JSON=$(gh pr view "$PR_NUM" --json state,headRefOid 2>/dev/null) || {
+              sleep $((i * 5))
+              continue
+            }
+            STATE=$(jq -r '.state' <<<"$PR_JSON")
+            PR_HEAD=$(jq -r '.headRefOid' <<<"$PR_JSON")
+            [ "$PR_HEAD" != "$BOT_SHA" ] && exit 0
+            [ "$STATE" != "OPEN" ] && exit 0
+            gh pr close "$PR_NUM" && exit 0
+            sleep $((i * 5))
+          done
+          exit 1
