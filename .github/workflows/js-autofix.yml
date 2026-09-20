@@ -249,10 +249,34 @@ jobs:
           BOT_BRANCH: bot/js-autofix
           BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
         run: |
-          set -euo pipefail
-          git push \
-            --force-with-lease="refs/heads/$BOT_BRANCH:$BOT_SHA" \
-            origin --delete "$BOT_BRANCH"
+          set -u
+          CLEANED=false
+          for i in $(seq 1 5); do
+            if git push \
+              --force-with-lease="refs/heads/$BOT_BRANCH:$BOT_SHA" \
+              origin --delete "$BOT_BRANCH"; then
+              CLEANED=true
+              break
+            fi
+            REMOTE=$(git ls-remote --heads origin "refs/heads/$BOT_BRANCH" 2>/dev/null) || {
+              sleep $((i * 5))
+              continue
+            }
+            if [ -z "$REMOTE" ]; then
+              CLEANED=true
+              break
+            fi
+            REMOTE_SHA=${REMOTE%%[[:space:]]*}
+            if [ "$REMOTE_SHA" != "$BOT_SHA" ]; then
+              echo "::error::Bot branch moved; refusing to delete a newer head"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$CLEANED" != "true" ]; then
+            echo "::error::Could not verify or delete exact bot branch after 5 attempts"
+            exit 1
+          fi
           echo "::error::Fallback provenance upload failed twice; exact bot branch removed"
           exit 1
 
@@ -346,11 +370,20 @@ jobs:
 
           [ -n "$PR_NUM" ] || exit 1
           for i in $(seq 1 5); do
-            STATE=$(gh pr view "$PR_NUM" --json state --jq '.state' 2>/dev/null) || {
+            PR_JSON=$(gh pr view "$PR_NUM" --json state,headRefOid 2>/dev/null) || {
               sleep $((i * 5))
               continue
             }
-            if [ "$STATE" != "OPEN" ] || gh pr close "$PR_NUM"; then
+            STATE=$(jq -r '.state' <<<"$PR_JSON")
+            PR_HEAD=$(jq -r '.headRefOid' <<<"$PR_JSON")
+            if [ "$STATE" != "OPEN" ]; then
+              exit 1
+            fi
+            if [ "$PR_HEAD" != "$BOT_SHA" ]; then
+              echo "Newer producer owns PR #$PR_NUM. Leaving it untouched."
+              exit 1
+            fi
+            if gh pr close "$PR_NUM"; then
               exit 1
             fi
             sleep $((i * 5))
@@ -458,7 +491,9 @@ jobs:
           always() &&
           steps.app-token.outputs.is-app-token != 'true' &&
           (cancelled() ||
-          (steps.manage-pr.outcome == 'failure' &&
+          ((steps.manage-pr.outcome == 'failure' ||
+          (steps.provenance-upload.outcome == 'failure' &&
+          steps.provenance-upload-retry.outcome == 'failure')) &&
           steps.dispatch-fallback.outputs.accepted != 'true'))
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}

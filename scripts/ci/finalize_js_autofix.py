@@ -298,8 +298,11 @@ class GitHubPort:
             workflows.append("deploy-site.yml")
         for workflow in workflows:
             for attempt in range(1, 6):
+                args = ["gh", "workflow", "run", workflow, "--repo", self.repo, "--ref", "main"]
+                if workflow == "docker.yml" and self.repo.casefold() == "nousresearch/hermes-agent":
+                    args.extend(["-f", "publish=true"])
                 result = self._run(
-                    ["gh", "workflow", "run", workflow, "--repo", self.repo, "--ref", "main"],
+                    args,
                     check=False,
                 )
                 if result.returncode == 0:

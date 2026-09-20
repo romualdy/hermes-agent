@@ -93,22 +93,39 @@ def test_finalizer_promotes_only_an_exact_trusted_green_lineage():
 
 def test_github_port_keeps_external_handoffs_recoverable(monkeypatch):
     port = GitHubPort("NousResearch/hermes-agent")
-    dispatched: list[str] = []
+    dispatched: list[list[str]] = []
 
     def dispatch_run(args, *, check=True):
         if args[:3] == ["git", "diff", "--name-only"]:
             return subprocess.CompletedProcess(args, 0, "website/src/app.ts\n", "")
-        dispatched.append(args[3])
+        dispatched.append(args[3:])
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(port, "_run", dispatch_run)
     port.dispatch_main_workflows("head")
-    assert dispatched == ["ci.yaml", "docker.yml", "nix.yml", "deploy-site.yml"]
+    assert dispatched == [
+        ["ci.yaml", "--repo", "NousResearch/hermes-agent", "--ref", "main"],
+        [
+            "docker.yml",
+            "--repo",
+            "NousResearch/hermes-agent",
+            "--ref",
+            "main",
+            "-f",
+            "publish=true",
+        ],
+        ["nix.yml", "--repo", "NousResearch/hermes-agent", "--ref", "main"],
+        ["deploy-site.yml", "--repo", "NousResearch/hermes-agent", "--ref", "main"],
+    ]
 
     dispatched.clear()
     port.repo = "owner/fork"
     port.dispatch_main_workflows("head")
-    assert dispatched == ["ci.yaml", "docker.yml", "nix.yml"]
+    assert dispatched == [
+        ["ci.yaml", "--repo", "owner/fork", "--ref", "main"],
+        ["docker.yml", "--repo", "owner/fork", "--ref", "main"],
+        ["nix.yml", "--repo", "owner/fork", "--ref", "main"],
+    ]
 
     downloads = 0
 
