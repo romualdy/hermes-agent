@@ -141,14 +141,17 @@ class GitHubPort:
         return self._gh("api", f"repos/{self.repo}/branches/main", "--jq", ".commit.sha")
 
     def main_contains(self, head_sha: str) -> bool:
-        fetch = self._run(["git", "fetch", "origin", "main"], check=False)
-        if fetch.returncode != 0:
-            return False
-        result = self._run(
-            ["git", "merge-base", "--is-ancestor", head_sha, "origin/main"],
-            check=False,
-        )
-        return result.returncode == 0
+        for attempt in range(1, 4):
+            fetch = self._run(["git", "fetch", "origin", "main"], check=False)
+            if fetch.returncode == 0:
+                result = self._run(
+                    ["git", "merge-base", "--is-ancestor", head_sha, "origin/main"],
+                    check=False,
+                )
+                return result.returncode == 0
+            if attempt < 3:
+                time.sleep(attempt * 5)
+        raise RuntimeError("could not refresh origin/main for ancestry check")
 
     def load_provenance(self, head_sha: str) -> Provenance | None:
         message = self._run(["git", "show", "-s", "--format=%B", head_sha]).stdout

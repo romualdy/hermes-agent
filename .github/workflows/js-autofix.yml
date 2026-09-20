@@ -198,8 +198,30 @@ jobs:
           # bot/js-autofix is a bot-only branch that gets rewritten each run.
           # If the branch was deleted after a previous PR merge, this
           # recreates it.
-          git push --force origin HEAD:"$BOT_BRANCH"
-          echo "head-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          BOT_SHA=$(git rev-parse HEAD)
+          echo "head-sha=$BOT_SHA" >> "$GITHUB_OUTPUT"
+          PUSHED=false
+          for i in $(seq 1 5); do
+            if git push --force origin HEAD:"$BOT_BRANCH"; then
+              PUSHED=true
+              break
+            fi
+            REMOTE=$(git ls-remote --heads origin "refs/heads/$BOT_BRANCH" 2>/dev/null) || true
+            if [ -n "$REMOTE" ]; then
+              REMOTE_SHA=${REMOTE%%[[:space:]]*}
+              if [ "$REMOTE_SHA" = "$BOT_SHA" ]; then
+                PUSHED=true
+                break
+              fi
+              echo "::error::Bot branch moved to a different head; refusing to overwrite it"
+              exit 1
+            fi
+            sleep $((i * 5))
+          done
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::Could not push or verify exact bot branch after 5 attempts"
+            exit 1
+          fi
 
       - name: Write fallback provenance
         id: provenance-write
@@ -399,10 +421,23 @@ jobs:
           START_SHA: ${{ github.sha }}
           BOT_SHA: ${{ steps.push-bot.outputs.head-sha }}
           MANAGE_OUTCOME: ${{ steps.manage-pr.outcome }}
+          MANAGED_PR_NUM: ${{ steps.manage-pr.outputs.pr-number }}
         run: |
           set -euo pipefail
 
-          PR_NUM=$(gh pr list --head bot/js-autofix --state open --json number --jq '.[0].number' 2>/dev/null || true)
+          PR_NUM="$MANAGED_PR_NUM"
+          if [ -z "$PR_NUM" ] && [ -z "$BOT_SHA" ] && [ "$MANAGE_OUTCOME" != "failure" ]; then
+            echo "No autofix head was produced. Nothing to wait for."
+            exit 0
+          fi
+          if [ -z "$PR_NUM" ]; then
+            for i in $(seq 1 5); do
+              if PR_NUM=$(gh pr list --head bot/js-autofix --state open --json number --jq '.[0].number' 2>/dev/null); then
+                [ -n "$PR_NUM" ] && break
+              fi
+              sleep $((i * 5))
+            done
+          fi
           if [ -z "$PR_NUM" ]; then
             if [ "$MANAGE_OUTCOME" = "failure" ] && [ -n "$BOT_SHA" ]; then
               for i in $(seq 1 5); do
@@ -414,8 +449,8 @@ jobs:
               echo "::error::PR creation failed and exact App bot branch cleanup could not be verified"
               exit 1
             fi
-            echo "No open PR. Nothing to wait for."
-            exit 0
+            echo "::error::Managed PR was not visible after 5 attempts"
+            exit 1
           fi
           if [ -z "$BOT_SHA" ]; then
             echo "::error::This run did not push a bot head; refusing to adopt an older PR"
@@ -492,7 +527,8 @@ jobs:
           always() &&
           steps.app-token.outputs.is-app-token != 'true' &&
           (cancelled() ||
-          ((steps.manage-pr.outcome == 'failure' ||
+          ((steps.push-bot.outcome == 'failure' ||
+          steps.manage-pr.outcome == 'failure' ||
           steps.provenance-write.outcome == 'failure' ||
           (steps.provenance-upload.outcome == 'failure' &&
           steps.provenance-upload-retry.outcome == 'failure')) &&
