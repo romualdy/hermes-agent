@@ -68,12 +68,13 @@ _DISPATCH = ["dispatch-ci", "dispatch-docker", "dispatch-nix"]
 
 def test_finalizer_promotes_only_an_exact_trusted_green_lineage():
     cases = [
-        ({}, "promoted", ["promote:head", "delete:bot/js-autofix:head", *_DISPATCH]),
+        ({}, "promoted", ["promote:head", *_DISPATCH, "delete:bot/js-autofix:head"]),
         ({"main": "new-main"}, "stale-base", ["delete:bot/js-autofix:head", "close:4"]),
         ({"required_gate": "failure"}, "ci-failed", ["delete:bot/js-autofix:head", "close:4"]),
         ({"required_gate": "superseded"}, "validation-superseded", []),
         ({"current_pr_head": "new-head", "branch_head": "new-head"}, "superseded", []),
         ({"branch_head": "new-head"}, "promoted", ["promote:head", *_DISPATCH]),
+        ({"main": "head"}, "post-merge-retry", [*_DISPATCH, "delete:bot/js-autofix:head", "close:4"]),
         ({"pr": PullRequest(4, "MERGED", "head"), "main": "head"}, "post-merge-retry", _DISPATCH),
         ({"trusted": False}, "untrusted", []),
         ({"provenance_base": "other-base"}, "untrusted", []),
@@ -209,6 +210,6 @@ def test_github_port_keeps_external_handoffs_recoverable(monkeypatch):
         return subprocess.CompletedProcess(args, 0, "head", "")
 
     monkeypatch.setattr(port, "_run", promote_run)
-    monkeypatch.setattr(port, "_main_sha_if_available", lambda: "head")
+    monkeypatch.setattr(port, "main_contains", lambda _head_sha: True)
     port.promote("head")
     assert pushes == 1

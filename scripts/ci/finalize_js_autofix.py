@@ -84,6 +84,11 @@ def finalize(port: FinalizerPort, *, head_sha: str, ci_run_id: int, ci_attempt: 
             return "superseded"
         return "ci-failed"
 
+    if port.main_contains(head_sha):
+        port.dispatch_main_workflows(head_sha)
+        port.close_exact(pr.number, BOT_BRANCH, head_sha)
+        return "post-merge-retry"
+
     validated_base = port.parent_sha(head_sha)
     if validated_base != provenance.base_sha:
         return "untrusted"
@@ -97,8 +102,8 @@ def finalize(port: FinalizerPort, *, head_sha: str, ci_run_id: int, ci_attempt: 
     # The push is deliberately non-force. It succeeds only while main is still
     # the validated parent, giving the base/head handoff an atomic CAS gate.
     port.promote(head_sha)
-    port.delete_branch_if_head(BOT_BRANCH, head_sha)
     port.dispatch_main_workflows(head_sha)
+    port.delete_branch_if_head(BOT_BRANCH, head_sha)
     return "promoted"
 
 
@@ -135,15 +140,10 @@ class GitHubPort:
     def main_sha(self) -> str:
         return self._gh("api", f"repos/{self.repo}/branches/main", "--jq", ".commit.sha")
 
-    def _main_sha_if_available(self) -> str | None:
-        result = self._run(
-            ["gh", "api", f"repos/{self.repo}/branches/main", "--jq", ".commit.sha"],
-            check=False,
-        )
-        return result.stdout.strip() if result.returncode == 0 else None
-
     def main_contains(self, head_sha: str) -> bool:
-        self._run(["git", "fetch", "origin", "main"])
+        fetch = self._run(["git", "fetch", "origin", "main"], check=False)
+        if fetch.returncode != 0:
+            return False
         result = self._run(
             ["git", "merge-base", "--is-ancestor", head_sha, "origin/main"],
             check=False,
@@ -290,7 +290,7 @@ class GitHubPort:
         push_args = ["git", "push", "origin", f"{head_sha}:refs/heads/main"]
         for attempt in range(1, 6):
             self._run(push_args, check=False)
-            if self._main_sha_if_available() == head_sha:
+            if self.main_contains(head_sha):
                 return
             if attempt < 5:
                 time.sleep(attempt * 5)
