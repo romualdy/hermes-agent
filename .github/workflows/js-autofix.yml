@@ -202,6 +202,7 @@ jobs:
           echo "head-sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Write fallback provenance
+        id: provenance-write
         if: steps.app-token.outputs.is-app-token != 'true'
         env:
           HEAD_SHA: ${{ steps.push-bot.outputs.head-sha }}
@@ -492,6 +493,7 @@ jobs:
           steps.app-token.outputs.is-app-token != 'true' &&
           (cancelled() ||
           ((steps.manage-pr.outcome == 'failure' ||
+          steps.provenance-write.outcome == 'failure' ||
           (steps.provenance-upload.outcome == 'failure' &&
           steps.provenance-upload-retry.outcome == 'failure')) &&
           steps.dispatch-fallback.outputs.accepted != 'true'))

@@ -135,6 +135,13 @@ class GitHubPort:
     def main_sha(self) -> str:
         return self._gh("api", f"repos/{self.repo}/branches/main", "--jq", ".commit.sha")
 
+    def _main_sha_if_available(self) -> str | None:
+        result = self._run(
+            ["gh", "api", f"repos/{self.repo}/branches/main", "--jq", ".commit.sha"],
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
     def main_contains(self, head_sha: str) -> bool:
         self._run(["git", "fetch", "origin", "main"])
         result = self._run(
@@ -280,9 +287,14 @@ class GitHubPort:
         return True
 
     def promote(self, head_sha: str) -> None:
-        self._run(["git", "push", "origin", f"{head_sha}:refs/heads/main"])
-        if self.main_sha() != head_sha:
-            raise RuntimeError("main did not advance to the validated autofix head")
+        push_args = ["git", "push", "origin", f"{head_sha}:refs/heads/main"]
+        for attempt in range(1, 6):
+            self._run(push_args, check=False)
+            if self._main_sha_if_available() == head_sha:
+                return
+            if attempt < 5:
+                time.sleep(attempt * 5)
+        raise RuntimeError("main did not advance to the validated autofix head")
 
     def delete_branch_if_head(self, branch: str, head_sha: str) -> None:
         self._delete_branch_cas(branch, head_sha)

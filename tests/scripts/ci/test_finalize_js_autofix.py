@@ -198,3 +198,17 @@ def test_github_port_keeps_external_handoffs_recoverable(monkeypatch):
     monkeypatch.setattr(port, "_run", delete_run)
     assert port._delete_branch_cas("bot/js-autofix", "head") is True
     assert deletes == 3
+
+    pushes = 0
+
+    def promote_run(args, *, check=True):
+        nonlocal pushes
+        if args[:2] == ["git", "push"]:
+            pushes += 1
+            return subprocess.CompletedProcess(args, 1, "", "connection lost")
+        return subprocess.CompletedProcess(args, 0, "head", "")
+
+    monkeypatch.setattr(port, "_run", promote_run)
+    monkeypatch.setattr(port, "_main_sha_if_available", lambda: "head")
+    port.promote("head")
+    assert pushes == 1
